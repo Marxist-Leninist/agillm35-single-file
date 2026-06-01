@@ -51,4 +51,6 @@ python agillm35.py train \
 
 This repository contains code only, not AGILLM3 checkpoint weights.
 
+DiffusionBlock logs report raw CE-style `loss` plus the actual EDM-weighted training objective as `weighted`. The weighted value is the optimization target; the raw value is the sanity-check number to compare with ordinary AR/SAT loss.
+
 The Linux smoke test compiles the single file and completes a one-step synthetic training save. The full AGILLM3.5 continuation run is managed separately by the disaggregated Hetzner worker setup.

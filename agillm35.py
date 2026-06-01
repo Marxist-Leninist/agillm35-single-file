@@ -334,7 +334,22 @@ def _sample_sigma(ids, lo, hi, args, state):
     return torch.from_numpy(sig_np).to(ids.device)
 
 
-def _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved, objective=None):
+def _maybe_log(
+    state,
+    args,
+    bi,
+    layers,
+    ar_val,
+    sat_val,
+    nat_val,
+    total_val,
+    peak_alloc,
+    peak_reserved,
+    objective=None,
+    raw_avg=None,
+    raw_total=None,
+    edm_weight=None,
+):
     log_every = int(getattr(args, "dblock_log_every", 50))
     step = int(state.get("step", 0))
     if log_every <= 0 or step % log_every != 0:
@@ -344,10 +359,16 @@ def _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, pea
     mem = ""
     if peak_alloc is not None:
         mem = f" peak_alloc={peak_alloc:.2f}GB peak_reserved={peak_reserved:.2f}GB"
+    display = float(raw_avg) if raw_avg is not None and math.isfinite(float(raw_avg)) else float(total_val)
+    raw_part = ""
+    if raw_total is not None:
+        raw_part += f" raw_sum={float(raw_total):.3f}"
+    if edm_weight is not None:
+        raw_part += f" edm_w={float(edm_weight):.3f}"
     print(
         f"[dblock] step={step} block={bi} obj={objective or 'mixed'} layers={layers} "
-        f"loss={total_val:.3f} ar={ar_val:.3f} sat={sat_val:.3f} nat={nat_val:.3f} "
-        f"counts=[{counts}] ema=[{emas}]{mem}",
+        f"loss={display:.3f} weighted={total_val:.3f} ar={ar_val:.3f} sat={sat_val:.3f} nat={nat_val:.3f}"
+        f"{raw_part} counts=[{counts}] ema=[{emas}]{mem}",
         flush=True,
     )
 
@@ -494,6 +515,9 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     ar_val = 0.0
     sat_val = 0.0
     nat_val = 0.0
+    ar_raw_val = 0.0
+    sat_raw_val = 0.0
+    nat_raw_val = 0.0
 
     if run_ar:
         causal = M.causal_mask(T, structured=M.use_structured_masks(args))
@@ -510,13 +534,15 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         ar_hidden, ar_targets, ar_used, ar_total = _sample_token_loss_inputs(
             Dn[:, :-1], ids[:, 1:], int(getattr(args, "dblock_ar_loss_tokens", 0))
         )
-        ar = ar_weight * w * fused_ce(ar_hidden, ar_h.proj.weight, ar_targets)
+        ar_raw = fused_ce(ar_hidden, ar_h.proj.weight, ar_targets)
+        ar_raw_val = float(ar_raw.detach())
+        ar = ar_weight * w * ar_raw
         ar_val = float(ar.detach())
         _profile_toc(state, "ar_ce", _t)
         _t = _profile_tic(prof)
         scaler.scale(ar).backward()
         _profile_toc(state, "ar_backward", _t)
-        del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar, ar_used, ar_total
+        del causal, emb, zt, h, Dn, ar_hidden, ar_targets, ar_raw, ar, ar_used, ar_total
 
     if run_sat:
         smask = M.sat_mask(T, structured=M.use_structured_masks(args))
@@ -545,13 +571,15 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
                 if sat_h.gate is not None
                 else 0.0
             )
-            sat = sat_weight * w * (satf + satv)
+            sat_raw = satf + satv
+            sat_raw_val = float(sat_raw.detach())
+            sat = sat_weight * w * sat_raw
         _profile_toc(state, "sat_ce", _t)
         sat_val = float(sat.detach())
         _t = _profile_tic(prof)
         scaler.scale(sat).backward()
         _profile_toc(state, "sat_backward", _t)
-        del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat
+        del smask, emb2, zt2, h2, Ds, last, sat_hidden, sat_targets, satf, satv, sat_raw, sat
 
     if run_nat:
         ratio = min(max(float(getattr(args, "nat_mask_ratio", 0.5)), 0.05), 0.95)
@@ -574,15 +602,20 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
         nat_hidden, nat_targets, nat_used, nat_total = _sample_token_loss_inputs(
             nat_hidden.unsqueeze(0), nat_targets.unsqueeze(0), int(getattr(args, "dblock_nat_loss_tokens", 0))
         )
-        nat = nat_weight * fused_ce(nat_hidden, nat_h.proj.weight, nat_targets)
+        nat_raw = fused_ce(nat_hidden, nat_h.proj.weight, nat_targets)
+        nat_raw_val = float(nat_raw.detach())
+        nat = nat_weight * nat_raw
         nat_val = float(nat.detach())
         _profile_toc(state, "nat_ce", _t)
         _t = _profile_tic(prof)
         scaler.scale(nat).backward()
         _profile_toc(state, "nat_backward", _t)
-        del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat, nat_used, nat_total
+        del nat_ids, nat_in, m, hn, Dnat, nat_hidden, nat_targets, nat_raw, nat, nat_used, nat_total
 
     total_val = ar_val + sat_val + nat_val
+    raw_total_val = ar_raw_val + sat_raw_val + nat_raw_val
+    raw_count = int(bool(run_ar)) + int(bool(run_sat)) + int(bool(run_nat))
+    raw_avg_val = raw_total_val / max(1, raw_count)
     if not math.isfinite(total_val):
         opt.zero_grad(set_to_none=True)
         if torch.cuda.is_available():
@@ -609,8 +642,23 @@ def _dblock_step(core, ar_h, sat_h, nat_h, opt, scaler, args, ids, state):
     _profile_toc(state, "step_total", _step_t)
     _profile_step_done(state, args)
     _update_stats(state, bi, total_val)
-    _maybe_log(state, args, bi, layers, ar_val, sat_val, nat_val, total_val, peak_alloc, peak_reserved, objective=objective)
-    return total_val
+    _maybe_log(
+        state,
+        args,
+        bi,
+        layers,
+        ar_val,
+        sat_val,
+        nat_val,
+        total_val,
+        peak_alloc,
+        peak_reserved,
+        objective=objective,
+        raw_avg=raw_avg_val,
+        raw_total=raw_total_val,
+        edm_weight=w,
+    )
+    return raw_avg_val
 
 # ===== END dblocks_train.py =====
 
