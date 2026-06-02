@@ -60,6 +60,8 @@ AGILLM35_INFER_TOKEN='change-me' python distributed_infer/agillm35_distributed_i
 
 Network tensor payloads use a small raw tensor wire format rather than unpickling remote worker responses. Use TLS plus a bearer token for workers exposed beyond localhost. `--cache-mode kv` is the default and keeps per-session KV state on each worker after the prompt prefill, so decode steps send only the new hidden token through the pipeline. `--cache-mode full` is kept for comparison/debugging. SAT/NAT distributed decoding is a later phase.
 
+For inference against the live round-299 checkpoint, prefer the HF inference-slim artifact `distributed/inference/master_r299_20260602-205914_ar_infer_slim.pt`; it drops optimizer/SAT/disaggregated training state while preserving AR transformer inference.
+
 ## Defaults
 
 - tokenizer: `deepseek-ai/DeepSeek-V3.2`
