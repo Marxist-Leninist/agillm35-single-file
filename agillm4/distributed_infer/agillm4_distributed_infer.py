@@ -31,6 +31,9 @@ from urllib.request import Request, urlopen
 
 def load_agillm4(path: str | Path):
     path = Path(path).resolve()
+    parent = str(path.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
     spec = importlib.util.spec_from_file_location("agillm4_runtime", path)
     if spec is None or spec.loader is None:
         raise RuntimeError(f"cannot import AGILLM4 runtime from {path}")
