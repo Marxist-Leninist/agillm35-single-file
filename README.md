@@ -20,6 +20,46 @@ The runnable artifact is `agillm35.py`. The helper modules are folded into that 
 
 `public_join/agillm35_join_worker.py` is an outbound-only worker for untrusted joiners. It requests short-lived leases, verifies package hashes, runs a local worker command, and submits results to quarantine rather than exposing SSH or writing directly into the master merge path.
 
+## Distributed Inference
+
+`distributed_infer/agillm35_distributed_infer.py` is a single-file distributed AR inference harness for the real AGILLM3.5 transformer. It splits contiguous transformer/DiffusionBlock layer ranges across local or HTTP worker stages, using the actual `Block` implementation and MoE FFNs from the checkpoint config.
+
+Plan layer ranges:
+
+```bash
+python distributed_infer/agillm35_distributed_infer.py plan \
+  --agillm35-path ./agillm35.py \
+  --ckpt /path/to/master.pt \
+  --dblock-blocks 8
+```
+
+Start a worker for one layer range:
+
+```bash
+AGILLM35_INFER_TOKEN='change-me' python distributed_infer/agillm35_distributed_infer.py worker \
+  --agillm35-path ./agillm35.py \
+  --ckpt /path/to/master.pt \
+  --start-layer 0 \
+  --end-layer 12 \
+  --host 0.0.0.0 \
+  --port 9100
+```
+
+Run the coordinator:
+
+```bash
+AGILLM35_INFER_TOKEN='change-me' python distributed_infer/agillm35_distributed_infer.py infer \
+  --agillm35-path ./agillm35.py \
+  --ckpt /path/to/master.pt \
+  --prompt "Hello" \
+  --max-new 32 \
+  --cache-mode kv \
+  --stage https://worker-a.example:9100,0,12 \
+  --stage local:12:24
+```
+
+Network tensor payloads use a small raw tensor wire format rather than unpickling remote worker responses. Use TLS plus a bearer token for workers exposed beyond localhost. `--cache-mode kv` is the default and keeps per-session KV state on each worker after the prompt prefill, so decode steps send only the new hidden token through the pipeline. `--cache-mode full` is kept for comparison/debugging. SAT/NAT distributed decoding is a later phase.
+
 ## Defaults
 
 - tokenizer: `deepseek-ai/DeepSeek-V3.2`
