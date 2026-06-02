@@ -75,7 +75,45 @@ def load_ckpt(runtime: Any, ckpt_path: str | Path) -> dict[str, Any]:
             runtime.tok.backend_tokenizer = _Tokenizer.from_str(sd["tokenizer_json"])
         except Exception:
             pass
+    sync_runtime_vocab(runtime, sd)
     return sd
+
+
+def checkpoint_vocab_size(runtime: Any, sd: dict[str, Any]) -> int | None:
+    core = sd.get("core")
+    if isinstance(core, dict):
+        try:
+            core = runtime._strip_orig_mod_prefix(core)
+        except Exception:
+            pass
+        emb = core.get("emb.weight") if isinstance(core, dict) else None
+        if hasattr(emb, "shape") and len(emb.shape) >= 1:
+            return int(emb.shape[0])
+    ar = sd.get("ar")
+    if isinstance(ar, dict):
+        for key in ("proj.weight", "_orig_mod.proj.weight"):
+            weight = ar.get(key)
+            if hasattr(weight, "shape") and len(weight.shape) >= 1:
+                return int(weight.shape[0])
+    return None
+
+
+def sync_runtime_vocab(runtime: Any, sd: dict[str, Any]) -> int:
+    vocab = checkpoint_vocab_size(runtime, sd)
+    if vocab is None:
+        try:
+            vocab = len(runtime.tok)
+        except Exception:
+            vocab = int(runtime.VOCAB)
+    runtime.VOCAB = int(vocab)
+    for attr, token_attr in (("EOS", "eos_token_id"), ("BLANK", "pad_token_id")):
+        token_id = getattr(runtime.tok, token_attr, None)
+        if token_id is not None:
+            try:
+                setattr(runtime, attr, int(token_id))
+            except Exception:
+                pass
+    return int(vocab)
 
 
 def dblock_ranges(layers: int, blocks: int) -> list[tuple[int, int]]:
@@ -544,7 +582,8 @@ def restore_heads(runtime: Any, sd: dict[str, Any], device: str):
     torch = torch_io()
     cfg = sd["cfg"]
     tie_weights = bool(sd.get("tie_weights", False))
-    emb = torch.nn.Embedding(runtime.VOCAB, int(cfg["d"])).to(device)
+    vocab = sync_runtime_vocab(runtime, sd)
+    emb = torch.nn.Embedding(vocab, int(cfg["d"])).to(device)
     ln = torch.nn.LayerNorm(int(cfg["d"])).to(device)
     core_sd = runtime._strip_orig_mod_prefix(sd["core"])
     emb.weight.data.copy_(core_sd["emb.weight"].to(device))
