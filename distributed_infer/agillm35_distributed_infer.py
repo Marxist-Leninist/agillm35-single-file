@@ -9,6 +9,7 @@ checkpoint config. The coordinator keeps embeddings, final norm, and AR head.
 from __future__ import annotations
 
 import argparse
+import gc
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import importlib.util
 import io
@@ -161,6 +162,8 @@ class StageModule:
                     local_sd[dst_prefix + key[len(src_prefix):]] = value
         local_sd = runtime._prepare_core_state_dict_for_load(self.module, local_sd)
         self.module.load_state_dict(local_sd, strict=True)
+        del local_sd, core_sd
+        gc.collect()
         self.module.to(self.device)
         self.module.eval()
 
@@ -375,6 +378,8 @@ def cmd_worker(args: argparse.Namespace) -> None:
     sd = load_ckpt(runtime, args.ckpt)
     args.device = resolve_device(args.device)
     stage = StageModule(runtime, sd, args.start_layer, args.end_layer, args.device, args.attn_backend)
+    del sd
+    gc.collect()
     httpd = ThreadingHTTPServer((args.host, args.port), WorkerHandler)
     httpd.stage = stage  # type: ignore[attr-defined]
     httpd.token = args.token  # type: ignore[attr-defined]
@@ -566,6 +571,8 @@ def cmd_infer(args: argparse.Namespace) -> None:
         raise SystemExit("distributed phase-1 does not support anchor_memory yet")
     stages = parse_stage_specs(args, runtime, sd)
     emb, ln, ar_h = restore_heads(runtime, sd, args.device)
+    del sd
+    gc.collect()
     prompt_tokens = runtime.tok.encode(args.prompt)
     if not prompt_tokens:
         prompt_tokens = [runtime.EOS]
