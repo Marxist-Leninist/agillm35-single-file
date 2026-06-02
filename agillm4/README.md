@@ -6,6 +6,7 @@ onto the real AGILLM4 runtime in `/root/agillm35/nB300_agillm4.py`.
 ## Files
 
 - `distributed_infer/agillm4_distributed_infer.py` - staged AGILLM4 AR inference over local or HTTP workers.
+- `training_bench/` - non-destructive AGILLM4 DiffusionBlock all-node training benchmark.
 - `ops/agillm4_make_infer_slim.py` - exports a smaller AR inference checkpoint from full or delta checkpoints.
 - `ops/agillm4_boundary_control.sh` - asks a running AGILLM4 loop to flush or stop at a clean round boundary.
 - `ops/agillm4_round_boundary_hook.sh` - hook a loop calls after each completed round; exit 10 means save/flush, exit 20 means stop.
