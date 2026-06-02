@@ -10,6 +10,9 @@ onto the real AGILLM4 runtime in `/root/agillm35/nB300_agillm4.py`.
 - `ops/agillm4_make_infer_slim.py` - exports a smaller AR inference checkpoint from full or delta checkpoints.
 - `ops/agillm4_boundary_control.sh` - asks a running AGILLM4 loop to flush or stop at a clean round boundary.
 - `ops/agillm4_round_boundary_hook.sh` - hook a loop calls after each completed round; exit 10 means save/flush, exit 20 means stop.
+- `ops/agillm4_register_opportunistic_pool.sh`, `ops/agillm4_publish_opportunistic_lease.py`, and
+  `ops/agillm4_laptop_opportunistic_worker.ps1` - optional laptop side-worker flow. Vast stays master,
+  Hetzner stays reliable, and the laptop only contributes async leases when awake.
 
 ## Validation Command
 
