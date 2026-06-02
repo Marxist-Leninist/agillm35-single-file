@@ -580,6 +580,8 @@ def cmd_infer(args: argparse.Namespace) -> None:
     prompt_len = ids.size(1)
     stage_stats: list[dict[str, Any]] = []
     session_id = args.session_id or f"agillm35-{uuid.uuid4().hex}"
+    eos_id = getattr(runtime, "EOS", None)
+    generated_tokens = 0
     start = time.time()
     with torch.no_grad():
         if args.cache_mode == "kv":
@@ -598,6 +600,9 @@ def cmd_infer(args: argparse.Namespace) -> None:
                 h = ln(hidden.to(args.device))
                 nxt = sample_next(runtime, ar_h, h, ids, args)
                 ids = torch.cat([ids, nxt.detach().cpu()], dim=1)
+                generated_tokens += 1
+                if eos_id is not None and int(nxt.reshape(-1)[0].item()) == int(eos_id):
+                    break
                 if step + 1 >= int(args.max_new):
                     break
                 hidden = emb(nxt.to(args.device)).detach().cpu()
@@ -619,6 +624,9 @@ def cmd_infer(args: argparse.Namespace) -> None:
                 h = ln(hidden.to(args.device))
                 nxt = sample_next(runtime, ar_h, h, ids, args)
                 ids = torch.cat([ids, nxt.detach().cpu()], dim=1)
+                generated_tokens += 1
+                if eos_id is not None and int(nxt.reshape(-1)[0].item()) == int(eos_id):
+                    break
     elapsed = time.time() - start
     all_ids = ids[0].tolist()
     prompt = runtime.tok.decode(all_ids[:prompt_len], skip_special_tokens=True)
@@ -634,9 +642,9 @@ def cmd_infer(args: argparse.Namespace) -> None:
         "mode": args.mode,
         "cache_mode": args.cache_mode,
         "session_id": session_id if args.cache_mode == "kv" else None,
-        "tokens": int(args.max_new),
+        "tokens": generated_tokens,
         "elapsed_sec": round(elapsed, 3),
-        "tok_per_sec": round(int(args.max_new) / max(elapsed, 1e-9), 3),
+        "tok_per_sec": round(generated_tokens / max(elapsed, 1e-9), 3),
         "stages": by_stage,
     }
     if args.json:

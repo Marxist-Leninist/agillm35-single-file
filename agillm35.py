@@ -2514,10 +2514,17 @@ class NATHead(nn.Module):
 
 
 class SATHead(nn.Module):
-    def __init__(self, d, mode="var", tie_weights: bool = False, embedding_weight: nn.Parameter = None):
+    def __init__(self, d, mode="var", tie_weights: bool = False, embedding_weight: nn.Parameter = None, mlp: bool = False):
         super().__init__()
         self.tie_weights = tie_weights
-        if tie_weights and embedding_weight is not None:
+        self.mlp = bool(mlp)
+        if self.mlp:
+            self.proj = nn.Sequential(
+                nn.Linear(d, d),
+                nn.GELU(),
+                nn.Linear(d, VOCAB),
+            )
+        elif tie_weights and embedding_weight is not None:
             self.proj = nn.Linear(d, VOCAB, bias=False)
             self.proj.weight = embedding_weight
         else:
@@ -3017,6 +3024,13 @@ def _load_infer_head_state(module: nn.Module, state: dict, name: str):
         notes.append("ignored unexpected " + ", ".join(loaded.unexpected_keys[:6]))
     if notes:
         print(f"[infer-compat] {name}: " + "; ".join(notes), flush=True)
+
+
+def _sat_head_mlp_from_state(sd: dict) -> bool:
+    sat_sd = sd.get("sat", {})
+    if sd.get("delta") and "weights" in sd:
+        sat_sd = sd["weights"].get("sat", sat_sd)
+    return any(str(key).startswith("proj.2.") for key in sat_sd)
 
 
 def _parse_grow_plan(s: str) -> List[int]:
@@ -3690,7 +3704,8 @@ def infer(args):
         anchor_position=getattr(args, "anchor_position", DEFAULT_ANCHOR_POSITION),
     ).to(DEV)
     ar_h = ARHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV)
-    sat_h = SATHead(cfg["d"]).to(DEV)
+    sat_head_mlp = bool(sd.get("sat_head_mlp", False) or _sat_head_mlp_from_state(sd))
+    sat_h = SATHead(cfg["d"], mlp=sat_head_mlp).to(DEV)
     nat_h = NATHead(cfg["d"], tie_weights=tie_weights, embedding_weight=core.emb.weight if tie_weights else None).to(DEV) if ("nat" in sd or args.mode == "nat") else None
     core.load_state_dict(_prepare_core_state_dict_for_load(core, sd["core"]))
     ar_h.load_state_dict(sd["ar"])
@@ -3735,6 +3750,8 @@ def infer(args):
             logits = _apply_penalties(logits, ids, args.penalty_last_n, args.repetition_penalty, args.presence_penalty, args.frequency_penalty)
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
+            if EOS is not None and int(nxt.item()) == int(EOS):
+                break
             h, kvs = core(ids[:, -1:], None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
     elif args.mode == "nat":
         # Iterative mask-predict decode (CMLM): keep the prompt fixed and fill the
@@ -3799,11 +3816,14 @@ def infer(args):
             nxt = _sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
             ids = torch.cat([ids, nxt], 1)
             added += 1
-            h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
-            cached_len = ids.size(1)
-            h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
+            if EOS is not None and int(nxt.item()) == int(EOS):
+                stop = True
+            if not stop:
+                h, kvs = core(nxt, None, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
+                cached_len = ids.size(1)
+                h_buffer = torch.cat([h_buffer, h], dim=1)[:, -SAT_BLOCK:]
             
-        while added < args.max_new:
+        while added < args.max_new and not stop:
             logits_all, gate = sat_h(h_buffer)
             stride = SAT_BLOCK if (not args.var or gate is None) else (gate.softmax(-1).multinomial(1).item() + 1)
             stride = min(int(stride), logits_all.size(1))
@@ -3815,8 +3835,11 @@ def infer(args):
                 new_tokens.append(nxt)
                 ids = torch.cat([ids, nxt], 1)
                 added += 1
+                if EOS is not None and int(nxt.item()) == int(EOS):
+                    stop = True
+                    break
                 if added >= args.max_new: break
-            if added >= args.max_new: break
+            if stop or added >= args.max_new: break
             new_ids = torch.cat(new_tokens, dim=1)
             mask = sat_mask_cached(new_ids.size(1), cached_len, structured=use_structured_masks(args))
             h, kvs = core(new_ids, mask, kv_caches=kvs, use_cache=True, total_seq_len=ids.size(1))
