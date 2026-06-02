@@ -21,6 +21,7 @@ import ssl
 import struct
 import sys
 import time
+import uuid
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -98,6 +99,22 @@ def make_dense_mask(mode: str, n: int, device: Any, sat_block: int):
     raise ValueError(f"bad mode {mode!r}")
 
 
+def make_cached_mask(mode: str, q_len: int, total_seq_len: int, device: Any, sat_block: int):
+    torch = torch_io()
+    if mode == "ar":
+        if q_len == 1:
+            return None
+        k_len = int(total_seq_len)
+        q_start = k_len - int(q_len)
+        q_pos = torch.arange(q_start, k_len, device=device).view(q_len, 1)
+        k_pos = torch.arange(k_len, device=device).view(1, k_len)
+        blocked = k_pos > q_pos
+        return torch.where(blocked, float("-inf"), 0.0).view(1, 1, q_len, k_len)
+    if mode == "nat":
+        return None
+    return make_dense_mask(mode, int(total_seq_len), device, sat_block)[..., -int(q_len):, :]
+
+
 class StageModule:
     def __init__(
         self,
@@ -115,6 +132,9 @@ class StageModule:
         self.start_layer = int(start_layer)
         self.end_layer = int(end_layer)
         self.device = torch.device(device)
+        self.cache: dict[str, list[Any]] = {}
+        self.cache_last_used: dict[str, float] = {}
+        self.max_cache_sessions = 64
         self.module = nn.Module()
         self.module.blocks = nn.ModuleList(
             [
@@ -152,6 +172,50 @@ class StageModule:
         with torch.no_grad():
             for block in self.module.blocks:
                 x = block(x, mask)
+        return x.detach().cpu(), time.time() - start
+
+    def _prune_cache(self) -> None:
+        excess = len(self.cache) - self.max_cache_sessions
+        if excess <= 0:
+            return
+        for session_id, _ in sorted(self.cache_last_used.items(), key=lambda kv: kv[1])[:excess]:
+            self.cache.pop(session_id, None)
+            self.cache_last_used.pop(session_id, None)
+
+    def clear_cache(self, session_id: str) -> None:
+        self.cache.pop(session_id, None)
+        self.cache_last_used.pop(session_id, None)
+
+    def run_cached(
+        self,
+        hidden: Any,
+        mode: str,
+        sat_block: int,
+        session_id: str,
+        total_seq_len: int,
+        reset_cache: bool = False,
+    ) -> tuple[Any, float]:
+        torch = torch_io()
+        start = time.time()
+        if reset_cache:
+            self.clear_cache(session_id)
+        x = hidden.to(self.device)
+        q_len = int(x.size(1))
+        mask = make_cached_mask(mode, q_len, int(total_seq_len), self.device, sat_block)
+        kvs = self.cache.get(session_id)
+        if kvs is not None and len(kvs) != len(self.module.blocks):
+            kvs = None
+        new_kvs = []
+        with torch.no_grad():
+            for idx, block in enumerate(self.module.blocks):
+                kv = None if kvs is None else kvs[idx]
+                x, new_kv = block(x, mask, kv=kv, use_cache=True, total_seq_len=int(total_seq_len))
+                if isinstance(new_kv, tuple):
+                    new_kv = tuple(t.detach() for t in new_kv)
+                new_kvs.append(new_kv)
+        self.cache[session_id] = new_kvs
+        self.cache_last_used[session_id] = time.time()
+        self._prune_cache()
         return x.detach().cpu(), time.time() - start
 
 
@@ -273,11 +337,21 @@ class WorkerHandler(BaseHTTPRequestHandler):
             self.send_json(413, {"error": "payload too large", "bytes": n})
             return
         payload = tensor_from_payload(self.rfile.read(n))
-        hidden, sec = self.server.stage.run(  # type: ignore[attr-defined]
-            payload["hidden"],
-            str(payload.get("mode", "ar")),
-            int(payload.get("sat_block", 8)),
-        )
+        if bool(payload.get("use_cache", False)):
+            hidden, sec = self.server.stage.run_cached(  # type: ignore[attr-defined]
+                payload["hidden"],
+                str(payload.get("mode", "ar")),
+                int(payload.get("sat_block", 8)),
+                str(payload.get("session_id", "")),
+                int(payload.get("total_seq_len", int(payload["hidden"].size(1)))),
+                bool(payload.get("reset_cache", False)),
+            )
+        else:
+            hidden, sec = self.server.stage.run(  # type: ignore[attr-defined]
+                payload["hidden"],
+                str(payload.get("mode", "ar")),
+                int(payload.get("sat_block", 8)),
+            )
         body = tensor_payload(
             {
                 "hidden": hidden,
@@ -332,6 +406,18 @@ class LocalStageClient:
         out, sec = self.stage.run(hidden, mode, sat_block)
         return out, {"name": self.name, "sec": sec, "layers": [self.stage.start_layer, self.stage.end_layer]}
 
+    def run_cached(
+        self,
+        hidden: Any,
+        mode: str,
+        sat_block: int,
+        session_id: str,
+        total_seq_len: int,
+        reset_cache: bool,
+    ) -> tuple[Any, dict[str, Any]]:
+        out, sec = self.stage.run_cached(hidden, mode, sat_block, session_id, total_seq_len, reset_cache)
+        return out, {"name": self.name, "sec": sec, "layers": [self.stage.start_layer, self.stage.end_layer], "cached": True}
+
 
 class RemoteStageClient:
     def __init__(self, url: str, token: str, name: str, insecure: bool):
@@ -356,6 +442,43 @@ class RemoteStageClient:
             "sec": float(result.get("stage_sec", 0.0)),
             "wall_sec": wall,
             "layers": [result.get("start_layer"), result.get("end_layer")],
+        }
+
+    def run_cached(
+        self,
+        hidden: Any,
+        mode: str,
+        sat_block: int,
+        session_id: str,
+        total_seq_len: int,
+        reset_cache: bool,
+    ) -> tuple[Any, dict[str, Any]]:
+        payload = tensor_payload(
+            {
+                "hidden": hidden.detach().cpu(),
+                "mode": mode,
+                "sat_block": sat_block,
+                "use_cache": True,
+                "session_id": session_id,
+                "total_seq_len": int(total_seq_len),
+                "reset_cache": bool(reset_cache),
+            }
+        )
+        headers = {"Content-Type": "application/octet-stream"}
+        if self.token:
+            headers["Authorization"] = f"Bearer {self.token}"
+        req = Request(self.url + "/run", data=payload, method="POST", headers=headers)
+        context = ssl._create_unverified_context() if self.insecure else None
+        start = time.time()
+        with urlopen(req, timeout=600, context=context) as r:
+            result = tensor_from_payload(r.read())
+        wall = time.time() - start
+        return result["hidden"], {
+            "name": self.name,
+            "sec": float(result.get("stage_sec", 0.0)),
+            "wall_sec": wall,
+            "layers": [result.get("start_layer"), result.get("end_layer")],
+            "cached": True,
         }
 
 
@@ -395,6 +518,45 @@ def restore_heads(runtime: Any, sd: dict[str, Any], device: str):
     return emb, ln, ar_h
 
 
+def run_stage_pipeline(
+    stages: list[Any],
+    hidden: Any,
+    args: argparse.Namespace,
+    use_cache: bool = False,
+    session_id: str = "",
+    total_seq_len: int = 0,
+    reset_cache: bool = False,
+) -> tuple[Any, list[dict[str, Any]]]:
+    stats = []
+    for stage in stages:
+        if use_cache:
+            hidden, stat = stage.run_cached(
+                hidden,
+                args.mode,
+                args.sat_block,
+                session_id,
+                int(total_seq_len),
+                bool(reset_cache),
+            )
+        else:
+            hidden, stat = stage.run(hidden, args.mode, args.sat_block)
+        stats.append(stat)
+    return hidden, stats
+
+
+def sample_next(runtime: Any, ar_h: Any, hidden: Any, ids: Any, args: argparse.Namespace) -> Any:
+    logits = ar_h(hidden)[:, -1]
+    logits = runtime._apply_penalties(
+        logits,
+        ids.to(logits.device),
+        args.penalty_last_n,
+        args.repetition_penalty,
+        args.presence_penalty,
+        args.frequency_penalty,
+    )
+    return runtime._sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
+
+
 def cmd_infer(args: argparse.Namespace) -> None:
     torch = torch_io()
     runtime = load_agillm35(args.agillm35_path)
@@ -410,25 +572,46 @@ def cmd_infer(args: argparse.Namespace) -> None:
     ids = torch.tensor([prompt_tokens], dtype=torch.long)
     prompt_len = ids.size(1)
     stage_stats: list[dict[str, Any]] = []
+    session_id = args.session_id or f"agillm35-{uuid.uuid4().hex}"
     start = time.time()
     with torch.no_grad():
-        for _ in range(int(args.max_new)):
+        if args.cache_mode == "kv":
             hidden = emb(ids.to(args.device)).detach().cpu()
-            for stage in stages:
-                hidden, stat = stage.run(hidden, args.mode, args.sat_block)
-                stage_stats.append(stat)
-            h = ln(hidden.to(args.device))
-            logits = ar_h(h)[:, -1]
-            logits = runtime._apply_penalties(
-                logits,
-                ids.to(args.device),
-                args.penalty_last_n,
-                args.repetition_penalty,
-                args.presence_penalty,
-                args.frequency_penalty,
+            hidden, stats = run_stage_pipeline(
+                stages,
+                hidden,
+                args,
+                use_cache=True,
+                session_id=session_id,
+                total_seq_len=int(ids.size(1)),
+                reset_cache=True,
             )
-            nxt = runtime._sample(logits, args.temperature, args.top_k, args.top_p, args.min_p, args.greedy)
-            ids = torch.cat([ids, nxt.detach().cpu()], dim=1)
+            stage_stats.extend(stats)
+            for step in range(int(args.max_new)):
+                h = ln(hidden.to(args.device))
+                nxt = sample_next(runtime, ar_h, h, ids, args)
+                ids = torch.cat([ids, nxt.detach().cpu()], dim=1)
+                if step + 1 >= int(args.max_new):
+                    break
+                hidden = emb(nxt.to(args.device)).detach().cpu()
+                hidden, stats = run_stage_pipeline(
+                    stages,
+                    hidden,
+                    args,
+                    use_cache=True,
+                    session_id=session_id,
+                    total_seq_len=int(ids.size(1)),
+                    reset_cache=False,
+                )
+                stage_stats.extend(stats)
+        else:
+            for _ in range(int(args.max_new)):
+                hidden = emb(ids.to(args.device)).detach().cpu()
+                hidden, stats = run_stage_pipeline(stages, hidden, args, use_cache=False)
+                stage_stats.extend(stats)
+                h = ln(hidden.to(args.device))
+                nxt = sample_next(runtime, ar_h, h, ids, args)
+                ids = torch.cat([ids, nxt.detach().cpu()], dim=1)
     elapsed = time.time() - start
     all_ids = ids[0].tolist()
     prompt = runtime.tok.decode(all_ids[:prompt_len], skip_special_tokens=True)
@@ -442,6 +625,8 @@ def cmd_infer(args: argparse.Namespace) -> None:
     result = {
         "event": "distributed_infer_done",
         "mode": args.mode,
+        "cache_mode": args.cache_mode,
+        "session_id": session_id if args.cache_mode == "kv" else None,
         "tokens": int(args.max_new),
         "elapsed_sec": round(elapsed, 3),
         "tok_per_sec": round(int(args.max_new) / max(elapsed, 1e-9), 3),
@@ -492,6 +677,8 @@ def main() -> int:
     p.add_argument("--prompt", required=True)
     p.add_argument("--max-new", type=int, default=16)
     p.add_argument("--mode", choices=["ar"], default="ar")
+    p.add_argument("--cache-mode", choices=["kv", "full"], default="kv")
+    p.add_argument("--session-id", default="")
     p.add_argument("--stage", action="append", help="local:START:END or URL,START,END. Repeat in pipeline order.")
     p.add_argument("--token", default=os.environ.get("AGILLM35_INFER_TOKEN", ""))
     p.add_argument("--insecure", action="store_true")

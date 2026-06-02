@@ -22,7 +22,7 @@ The runnable artifact is `agillm35.py`. The helper modules are folded into that 
 
 ## Distributed Inference
 
-`distributed_infer/agillm35_distributed_infer.py` is a single-file phase-1 distributed AR inference harness for the real AGILLM3.5 transformer. It splits contiguous transformer/DiffusionBlock layer ranges across local or HTTP worker stages, using the actual `Block` implementation and MoE FFNs from the checkpoint config.
+`distributed_infer/agillm35_distributed_infer.py` is a single-file distributed AR inference harness for the real AGILLM3.5 transformer. It splits contiguous transformer/DiffusionBlock layer ranges across local or HTTP worker stages, using the actual `Block` implementation and MoE FFNs from the checkpoint config.
 
 Plan layer ranges:
 
@@ -53,11 +53,12 @@ AGILLM35_INFER_TOKEN='change-me' python distributed_infer/agillm35_distributed_i
   --ckpt /path/to/master.pt \
   --prompt "Hello" \
   --max-new 32 \
+  --cache-mode kv \
   --stage https://worker-a.example:9100,0,12 \
   --stage local:12:24
 ```
 
-Network tensor payloads use a small raw tensor wire format rather than unpickling remote worker responses. Use TLS plus a bearer token for workers exposed beyond localhost. This first phase is exact full-sequence AR inference; KV-cache pipelining and SAT/NAT distributed decoding are later phases.
+Network tensor payloads use a small raw tensor wire format rather than unpickling remote worker responses. Use TLS plus a bearer token for workers exposed beyond localhost. `--cache-mode kv` is the default and keeps per-session KV state on each worker after the prompt prefill, so decode steps send only the new hidden token through the pipeline. `--cache-mode full` is kept for comparison/debugging. SAT/NAT distributed decoding is a later phase.
 
 ## Defaults
 
