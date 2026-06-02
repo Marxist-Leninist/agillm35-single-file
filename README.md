@@ -14,6 +14,12 @@ AGILLM3.5 is the AGILLM3 checkpoint/tokenizer contract running on the AGILLM4 ru
 
 The runnable artifact is `agillm35.py`. The helper modules are folded into that one file so the runtime can be cloned, inspected, and launched without restoring the whole AGILLM4 source tree.
 
+## Public Join Scripts
+
+`public_join/agillm35_network_host.py` starts a signed-lease HTTPS coordinator for people who want to run their own network.
+
+`public_join/agillm35_join_worker.py` is an outbound-only worker for untrusted joiners. It requests short-lived leases, verifies package hashes, runs a local worker command, and submits results to quarantine rather than exposing SSH or writing directly into the master merge path.
+
 ## Defaults
 
 - tokenizer: `deepseek-ai/DeepSeek-V3.2`
