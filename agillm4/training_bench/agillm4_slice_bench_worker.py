@@ -11,19 +11,56 @@ from pathlib import Path
 import platform
 import sys
 import time
+from types import ModuleType
 from types import SimpleNamespace
 from typing import Any
 
 os.environ.setdefault("AGILLM_SYNTHETIC_TOKENIZER", "1")
+if os.name == "nt":
+    try:
+        import ctypes
+
+        ctypes.windll.kernel32.SetErrorMode(0x0001 | 0x0002 | 0x8000)
+    except Exception:
+        pass
 
 import torch
 import torch.nn as nn
+
+
+def install_runtime_import_stubs() -> None:
+    """Avoid trainer-only dataset/tokenizer imports while loading model classes."""
+    datasets_stub = ModuleType("datasets")
+
+    class DownloadConfig:
+        def __init__(self, *args: Any, **kwargs: Any) -> None:
+            self.args = args
+            self.kwargs = kwargs
+
+    def load_dataset(*_args: Any, **_kwargs: Any) -> Any:
+        raise RuntimeError("datasets.load_dataset is unavailable in the slice worker")
+
+    datasets_stub.DownloadConfig = DownloadConfig
+    datasets_stub.load_dataset = load_dataset
+    sys.modules["datasets"] = datasets_stub
+
+    transformers_stub = ModuleType("transformers")
+
+    class AutoTokenizer:
+        @classmethod
+        def from_pretrained(cls, *_args: Any, **_kwargs: Any) -> Any:
+            raise RuntimeError("AutoTokenizer is unavailable in synthetic-tokenizer slice worker mode")
+
+    transformers_stub.AutoTokenizer = AutoTokenizer
+    transformers_stub.logging = SimpleNamespace(set_verbosity_error=lambda: None)
+    sys.modules["transformers"] = transformers_stub
 
 
 def load_runtime(path: str | Path, vocab: int):
     path = Path(path).resolve()
     os.environ["AGILLM_SYNTHETIC_TOKENIZER"] = "1"
     os.environ["AGILLM_SYNTHETIC_VOCAB"] = str(int(vocab))
+    install_runtime_import_stubs()
     parent = str(path.parent)
     if parent not in sys.path:
         sys.path.insert(0, parent)

@@ -104,6 +104,7 @@ function Run-Worker([string]$RunDevice, [string]$LeaseStamp) {
   $env:OMP_NUM_THREADS = [string]$resolvedThreads
   $env:MKL_NUM_THREADS = [string]$resolvedThreads
   $env:OPENBLAS_NUM_THREADS = [string]$resolvedThreads
+  $env:PYTHONWARNINGS = "ignore::FutureWarning"
   $args = @(
     "-u", $worker,
     "--package", $package,
@@ -114,8 +115,14 @@ function Run-Worker([string]$RunDevice, [string]$LeaseStamp) {
     "--threads", [string]$resolvedThreads
   )
   Write-Heartbeat "running" @{ lease = $LeaseStamp; run_device = $RunDevice }
-  & $Python @args > $log 2>&1
-  $rc = $LASTEXITCODE
+  $oldErrorActionPreference = $ErrorActionPreference
+  try {
+    $ErrorActionPreference = "Continue"
+    & $Python @args > $log 2>&1
+    $rc = $LASTEXITCODE
+  } finally {
+    $ErrorActionPreference = $oldErrorActionPreference
+  }
   if ($rc -ne 0) {
     Write-Heartbeat "worker_failed" @{ lease = $LeaseStamp; run_device = $RunDevice; rc = $rc; log = $log }
     return $null
