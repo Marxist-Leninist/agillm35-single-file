@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Publish a copied AGILLM4 benchmark lease for an optional laptop worker."""
+"""Publish a copied AGILLM4.1 benchmark lease for an optional laptop worker."""
 from __future__ import annotations
 
 import argparse
@@ -25,13 +25,13 @@ def find_package(export_dir: Path, worker_id: str, source_worker: str | None) ->
         matches = sorted(export_dir.glob(pat))
         if matches:
             return matches[0]
-    raise FileNotFoundError(f"no AGILLM4 lease package found in {export_dir}")
+    raise FileNotFoundError(f"no AGILLM4.1 lease package found in {export_dir}")
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--export-dir", required=True)
-    ap.add_argument("--root", default="/root/agillm4_opportunistic")
+    ap.add_argument("--root", default="/root/agillm41_opportunistic")
     ap.add_argument("--worker-id", default="laptop-auto")
     ap.add_argument("--source-worker", default="", help="reuse another worker package, e.g. geth")
     ap.add_argument("--rewrite-worker-id", action=argparse.BooleanOptionalAction, default=True)
@@ -77,7 +77,7 @@ def main() -> int:
                 break
 
     sidecar = {
-        "event": "agillm4_opportunistic_lease",
+        "event": "agillm41_opportunistic_lease",
         "worker_id": args.worker_id,
         "source_package": str(pkg_src),
         "source_manifest": str(manifest_src) if manifest_src.exists() else None,

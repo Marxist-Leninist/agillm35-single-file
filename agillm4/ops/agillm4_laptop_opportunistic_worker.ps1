@@ -2,12 +2,14 @@ param(
   [string]$GethHost = "5.75.217.57",
   [string]$GethUser = "root",
   [string]$KeyPath = "$env:USERPROFILE\.ssh\agillm35_laptop_reverse_ed25519",
-  [string]$RemoteRoot = "/root/agillm4_opportunistic",
-  [string]$LocalRoot = "C:\agillm4_worker",
+  [string]$RemoteRoot = "/root/agillm41_opportunistic",
+  [string]$LocalRoot = "C:\agillm41_worker",
   [string]$WorkerId = "laptop-auto",
   [string]$Python = "python",
+  [string]$DirectMLPython = "C:\agillm41_worker\dml_venv\Scripts\python.exe",
   [string]$Device = "auto",
   [int]$Threads = 0,
+  [int]$LaneTimeoutSeconds = 300,
   [int]$PollSeconds = 300,
   [switch]$Once,
   [switch]$Force,
@@ -87,20 +89,48 @@ function Get-RemoteStat([string]$Path) {
 function Copy-IfSizeDiffers([string]$RemotePath, [string]$LocalPath) {
   $stat = Get-RemoteStat $RemotePath
   if ($null -eq $stat) { throw "missing remote path $RemotePath" }
-  if ((Test-Path -LiteralPath $LocalPath) -and ((Get-Item -LiteralPath $LocalPath).Length -eq $stat.Size)) {
+  $stampPath = "$LocalPath.stamp"
+  if (
+    (Test-Path -LiteralPath $LocalPath) -and
+    (Test-Path -LiteralPath $stampPath) -and
+    ((Get-Content -LiteralPath $stampPath -Raw).Trim() -eq $stat.Stamp)
+  ) {
     return
   }
   Invoke-SCPFrom $RemotePath $LocalPath
+  Set-Content -LiteralPath $stampPath -Encoding ascii -Value $stat.Stamp
 }
 
-function Run-Worker([string]$RunDevice, [string]$LeaseStamp) {
+function Get-DeviceLanes {
+  if ($Device -eq "auto") {
+    $lanes = @(
+      @{ Device = "cuda:0"; Suffix = "cuda0"; Python = $Python },
+      @{ Device = "directml:1"; Suffix = "igpu"; Python = $DirectMLPython },
+      @{ Device = "cpu"; Suffix = "cpu"; Python = $Python }
+    )
+    return @($lanes | Where-Object { ($_.Device -notlike "directml:*") -or (Test-Path -LiteralPath $_.Python) })
+  }
+  $suffix = ($Device -replace "[:\\\/\s]", "_")
+  $pythonExe = if ($Device -like "directml:*" -or $Device -eq "directml" -or $Device -eq "dml" -or $Device -eq "igpu") { $DirectMLPython } else { $Python }
+  return @(@{ Device = $Device; Suffix = $suffix; Python = $pythonExe })
+}
+
+function Run-Worker([hashtable]$Lane, [string]$LeaseStamp) {
+  $RunDevice = [string]$Lane.Device
+  $laneSuffix = [string]$Lane.Suffix
+  $pythonExe = [string]$Lane.Python
+  if (($RunDevice -like "directml:*" -or $RunDevice -eq "directml" -or $RunDevice -eq "dml" -or $RunDevice -eq "igpu") -and (-not (Test-Path -LiteralPath $pythonExe))) {
+    Write-Heartbeat "worker_skipped" @{ lease = $LeaseStamp; run_device = $RunDevice; lane = $laneSuffix; reason = "missing_directml_python"; python = $pythonExe }
+    return $null
+  }
   $worker = Join-Path $LocalRoot "code\agillm4_slice_bench_worker.py"
   $package = Join-Path $LocalRoot "packages\lease_$WorkerId.pt"
   $shared = Join-Path $LocalRoot "packages\shared_frozen.pt"
-  $runtime = Join-Path $LocalRoot "runtime\nB300_agillm4.py"
-  $out = Join-Path $LocalRoot "updates\$WorkerId`_$LeaseStamp.pt"
-  $log = Join-Path $LocalRoot "logs\$WorkerId`_$LeaseStamp`_$($RunDevice.Replace(':','_')).log"
+  $runtime = Join-Path $LocalRoot "runtime\agillm41.py"
+  $out = Join-Path $LocalRoot "updates\$WorkerId`_$LeaseStamp`_$laneSuffix.pt"
+  $log = Join-Path $LocalRoot "logs\$WorkerId`_$LeaseStamp`_$laneSuffix.log"
   Remove-Item -LiteralPath $out -ErrorAction SilentlyContinue
+  Remove-Item -LiteralPath "$out.tmp" -ErrorAction SilentlyContinue
   $env:OMP_NUM_THREADS = [string]$resolvedThreads
   $env:MKL_NUM_THREADS = [string]$resolvedThreads
   $env:OPENBLAS_NUM_THREADS = [string]$resolvedThreads
@@ -112,19 +142,38 @@ function Run-Worker([string]$RunDevice, [string]$LeaseStamp) {
     "--runtime", $runtime,
     "--out", $out,
     "--device", $RunDevice,
-    "--threads", [string]$resolvedThreads
+    "--threads", [string]$resolvedThreads,
+    "--worker-id", "$WorkerId-$laneSuffix"
   )
-  Write-Heartbeat "running" @{ lease = $LeaseStamp; run_device = $RunDevice }
+  Write-Heartbeat "running" @{ lease = $LeaseStamp; run_device = $RunDevice; lane = $laneSuffix; python = $pythonExe }
   $oldErrorActionPreference = $ErrorActionPreference
   try {
     $ErrorActionPreference = "Continue"
-    & $Python @args > $log 2>&1
-    $rc = $LASTEXITCODE
+    if ($LaneTimeoutSeconds -gt 0) {
+      $job = Start-Job -ScriptBlock {
+        param([string]$JobPython, [string[]]$JobArgs, [string]$JobLog)
+        & $JobPython @JobArgs > $JobLog 2>&1
+        return $LASTEXITCODE
+      } -ArgumentList $pythonExe, $args, $log
+      $completed = Wait-Job $job -Timeout $LaneTimeoutSeconds
+      if ($null -ne $completed) {
+        $jobResult = Receive-Job $job
+        $rc = if ($jobResult -is [array]) { [int]$jobResult[-1] } else { [int]$jobResult }
+      } else {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Add-Content -LiteralPath $log -Encoding ascii -Value "lane timed out after $LaneTimeoutSeconds seconds"
+        $rc = 124
+      }
+      Remove-Job $job -Force -ErrorAction SilentlyContinue
+    } else {
+      & $pythonExe @args > $log 2>&1
+      $rc = $LASTEXITCODE
+    }
   } finally {
     $ErrorActionPreference = $oldErrorActionPreference
   }
   if ($rc -ne 0) {
-    Write-Heartbeat "worker_failed" @{ lease = $LeaseStamp; run_device = $RunDevice; rc = $rc; log = $log }
+    Write-Heartbeat "worker_failed" @{ lease = $LeaseStamp; run_device = $RunDevice; lane = $laneSuffix; rc = $rc; log = $log }
     return $null
   }
   if (-not (Test-Path -LiteralPath $out)) { throw "worker completed but did not create $out" }
@@ -149,12 +198,12 @@ function One-Poll {
   }
 
   Write-Heartbeat "pulling" @{ lease = $leaseStamp }
-  Copy-IfSizeDiffers "$RemoteRoot/runtime/nB300_agillm4.py" (Join-Path $LocalRoot "runtime\nB300_agillm4.py")
-  Copy-IfSizeDiffers "$RemoteRoot/runtime/dblocks_train.py" (Join-Path $LocalRoot "runtime\dblocks_train.py")
-  Copy-IfSizeDiffers "$RemoteRoot/runtime/fused_ce.py" (Join-Path $LocalRoot "runtime\fused_ce.py")
-  $anchorStat = Get-RemoteStat "$RemoteRoot/runtime/anchor_memory.py"
-  if ($null -ne $anchorStat) {
-    Copy-IfSizeDiffers "$RemoteRoot/runtime/anchor_memory.py" (Join-Path $LocalRoot "runtime\anchor_memory.py")
+  Copy-IfSizeDiffers "$RemoteRoot/runtime/agillm41.py" (Join-Path $LocalRoot "runtime\agillm41.py")
+  foreach ($runtimeName in @("dblocks_train.py", "fused_ce.py", "anchor_memory.py")) {
+    $runtimeStat = Get-RemoteStat "$RemoteRoot/runtime/$runtimeName"
+    if ($null -ne $runtimeStat) {
+      Copy-IfSizeDiffers "$RemoteRoot/runtime/$runtimeName" (Join-Path $LocalRoot "runtime\$runtimeName")
+    }
   }
   Copy-IfSizeDiffers "$RemoteRoot/code/agillm4_slice_bench_worker.py" (Join-Path $LocalRoot "code\agillm4_slice_bench_worker.py")
   Copy-IfSizeDiffers "$RemoteRoot/current/shared_frozen.pt" (Join-Path $LocalRoot "packages\shared_frozen.pt")
@@ -165,47 +214,45 @@ function One-Poll {
     return
   }
 
-  $devices = @()
-  if ($Device -eq "auto") {
-    $devices = @("cuda:0", "cpu")
-  } else {
-    $devices = @($Device)
-    if ($Device.StartsWith("cuda")) { $devices += "cpu" }
+  $uploaded = @()
+  foreach ($lane in (Get-DeviceLanes)) {
+    $out = Run-Worker $lane $leaseStamp
+    if ($null -eq $out) { continue }
+    $laneSuffix = [string]$lane.Suffix
+    Write-Heartbeat "uploading" @{ lease = $leaseStamp; lane = $laneSuffix; bytes = (Get-Item -LiteralPath $out).Length }
+    $remoteOut = "$RemoteRoot/updates/$WorkerId`_$leaseStamp`_$laneSuffix.pt"
+    Invoke-SCPTo $out "$remoteOut.tmp"
+    Invoke-SSH "mv '$remoteOut.tmp' '$remoteOut'"
+    $uploaded += $remoteOut
   }
-
-  $out = $null
-  foreach ($runDevice in $devices) {
-    $out = Run-Worker $runDevice $leaseStamp
-    if ($null -ne $out) { break }
-  }
-  if ($null -eq $out) { throw "all requested devices failed for lease $leaseStamp" }
-
-  Write-Heartbeat "uploading" @{ lease = $leaseStamp; bytes = (Get-Item -LiteralPath $out).Length }
-  $remoteOut = "$RemoteRoot/updates/$WorkerId`_$LeaseStamp.pt"
-  Invoke-SCPTo $out "$remoteOut.tmp"
-  Invoke-SSH "mv '$remoteOut.tmp' '$remoteOut'"
+  if ($uploaded.Count -eq 0) { throw "all requested devices failed for lease $leaseStamp" }
   Set-Content -LiteralPath $doneFile -Encoding ascii -Value $leaseStamp
-  Write-Heartbeat "done" @{ lease = $leaseStamp; remote_update = $remoteOut; bytes = (Get-Item -LiteralPath $out).Length }
+  Write-Heartbeat "done" @{ lease = $leaseStamp; remote_updates = $uploaded; count = $uploaded.Count }
 }
 
 $lockPath = Join-Path $LocalRoot "state\worker.lock"
 New-Dirs
-if (Test-Path -LiteralPath $lockPath) {
+try {
+  New-Item -ItemType Directory -Path $lockPath -ErrorAction Stop | Out-Null
+} catch {
   try {
-    $existing = Get-Content -LiteralPath $lockPath -Raw | ConvertFrom-Json
+    $existing = Get-Content -LiteralPath (Join-Path $lockPath "owner.json") -Raw | ConvertFrom-Json
     $pid = [int]$existing.pid
     $proc = Get-Process -Id $pid -ErrorAction SilentlyContinue
     if ($proc) {
-      Write-Output "AGILLM4 opportunistic worker already running as PID $pid"
+      Write-Output "AGILLM4.1 opportunistic worker already running as PID $pid"
       exit 0
     }
-  } catch {}
+  } catch {
+    Write-Output "AGILLM4.1 opportunistic worker lock exists at $lockPath"
+    exit 0
+  }
 }
 @{
   pid = $PID
   worker_id = $WorkerId
   started_at = (Get-Date).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
-} | ConvertTo-Json | Set-Content -LiteralPath $lockPath -Encoding ascii
+} | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $lockPath "owner.json") -Encoding ascii
 
 try {
 while ($true) {
@@ -220,5 +267,13 @@ while ($true) {
   Start-Sleep -Seconds $PollSeconds
 }
 } finally {
-  Remove-Item -LiteralPath $lockPath -ErrorAction SilentlyContinue
+  try {
+    $ownerPath = Join-Path $lockPath "owner.json"
+    if (Test-Path -LiteralPath $ownerPath) {
+      $owner = Get-Content -LiteralPath $ownerPath -Raw | ConvertFrom-Json
+      if ([int]$owner.pid -eq $PID) {
+        Remove-Item -LiteralPath $lockPath -Recurse -Force -ErrorAction SilentlyContinue
+      }
+    }
+  } catch {}
 }

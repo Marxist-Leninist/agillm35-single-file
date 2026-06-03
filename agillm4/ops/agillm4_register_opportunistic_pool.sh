@@ -1,24 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="${1:-/root/agillm4_opportunistic}"
-UPGRADE="${AGILLM4_UPGRADE:-/root/agillm4_upgrade}"
+ROOT="${1:-/root/agillm41_opportunistic}"
+WORKER_ROOT="${AGILLM41_WORKER_ROOT:-/root/agillm41_worker}"
 
 mkdir -p "$ROOT"/{code,runtime,current,updates,heartbeats,logs,state}
 
-cp "$UPGRADE/training_bench/agillm4_slice_bench_worker.py" "$ROOT/code/agillm4_slice_bench_worker.py"
-cp "$UPGRADE/runtime/nB300_agillm4.py" "$ROOT/runtime/nB300_agillm4.py"
-cp "$UPGRADE/runtime/dblocks_train.py" "$ROOT/runtime/dblocks_train.py"
-cp "$UPGRADE/runtime/fused_ce.py" "$ROOT/runtime/fused_ce.py"
-if [ -f "$UPGRADE/runtime/anchor_memory.py" ]; then
-  cp "$UPGRADE/runtime/anchor_memory.py" "$ROOT/runtime/anchor_memory.py"
+cp "$WORKER_ROOT/code/agillm4_slice_bench_worker.py" "$ROOT/code/agillm4_slice_bench_worker.py"
+cp "$WORKER_ROOT/code/agillm41.py" "$ROOT/runtime/agillm41.py"
+if [ -f "$WORKER_ROOT/runtime/dblocks_train.py" ]; then
+  cp "$WORKER_ROOT/runtime/dblocks_train.py" "$ROOT/runtime/dblocks_train.py"
+fi
+if [ -f "$WORKER_ROOT/runtime/fused_ce.py" ]; then
+  cp "$WORKER_ROOT/runtime/fused_ce.py" "$ROOT/runtime/fused_ce.py"
+fi
+if [ -f "$WORKER_ROOT/runtime/anchor_memory.py" ]; then
+  cp "$WORKER_ROOT/runtime/anchor_memory.py" "$ROOT/runtime/anchor_memory.py"
 fi
 
 cat > "$ROOT/nodes.json" <<'JSON'
 {
   "policy": {
     "mode": "async_optional",
-    "description": "Vast.ai 4090 remains the master trainer. Hetzner/GETH nodes are reliable side-workers. The laptop is opportunistic: it may duplicate covered DBlocks, but it is never a required owner and stale/missing updates are ignored.",
+    "description": "Vast.ai 4090 remains the AGILLM4.1 master trainer. Hetzner/GETH nodes are reliable side-workers. The laptop is opportunistic: it may duplicate covered DBlocks, but it is never a required owner and stale/missing updates are ignored.",
     "master": {
       "name": "vast-4090",
       "role": "fast-but-less-reliable-master",
@@ -30,9 +34,9 @@ cat > "$ROOT/nodes.json" <<'JSON'
   },
   "reliable": [
     {"name": "geth", "kind": "local", "blocks": [0], "class": "reliable"},
-    {"name": "mcp", "kind": "ssh", "host": "10.0.1.20", "blocks": [1], "class": "reliable"},
-    {"name": "prime", "kind": "ssh", "host": "10.0.1.30", "blocks": [2], "class": "reliable"},
-    {"name": "communist-web", "kind": "ssh", "host": "10.0.1.1", "blocks": [3], "class": "reliable"}
+    {"name": "mcp", "kind": "ssh", "host": "10.0.1.20", "blocks": [1], "class": "reliable-small"},
+    {"name": "prime", "kind": "ssh", "host": "10.0.1.30", "blocks": [2], "class": "reliable-small"},
+    {"name": "communist-web", "kind": "ssh", "host": "10.0.1.1", "blocks": [3], "class": "reliable-small"}
   ],
   "opportunistic": [
     {
@@ -49,9 +53,9 @@ cat > "$ROOT/nodes.json" <<'JSON'
 JSON
 
 cat > "$ROOT/README.md" <<'MD'
-# AGILLM4 Opportunistic Worker Pool
+# AGILLM4.1 Opportunistic Worker Pool
 
-This directory is a non-blocking side-worker queue. Vast.ai remains the AGILLM4
+This directory is a non-blocking side-worker queue. Vast.ai remains the AGILLM4.1
 master trainer. Hetzner/GETH nodes are the reliable pool. The laptop is an
 opportunistic outbound-pull worker: if it is off, asleep, or slow, the master
 continues without it.

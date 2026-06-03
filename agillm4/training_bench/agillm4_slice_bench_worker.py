@@ -85,6 +85,20 @@ def load_runtime(path: str | Path, vocab: int):
     return module
 
 
+def resolve_device(name: str) -> torch.device:
+    raw = str(name).strip().lower()
+    if raw in {"directml", "dml", "igpu"} or raw.startswith(("directml:", "dml:", "igpu:")):
+        try:
+            import torch_directml
+        except Exception as exc:
+            raise RuntimeError("DirectML device requested but torch_directml is not installed") from exc
+        idx = 0
+        if ":" in raw:
+            idx = int(raw.split(":", 1)[1])
+        return torch_directml.device(idx)
+    return torch.device(name)
+
+
 def block_kwargs(runtime: Any, cfg: dict[str, Any], rargs: dict[str, Any]) -> dict[str, Any]:
     return {
         "attn_backend": rargs.get("attn_backend", "manual"),
@@ -180,6 +194,7 @@ def main() -> int:
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=2)
     ap.add_argument("--update-kind", default="agillm41_dblock_slice_update")
+    ap.add_argument("--worker-id", default="", help="override package worker_id in the emitted update")
     args = ap.parse_args()
 
     torch.set_num_threads(max(1, int(args.threads)))
@@ -191,7 +206,7 @@ def main() -> int:
     cfg = dict(pkg["cfg"])
     rargs = dict(pkg.get("runtime_args", {}))
     layers = [int(x) for x in pkg["layers"]]
-    device = torch.device(args.device)
+    device = resolve_device(args.device)
     core = SliceCore(runtime, cfg, rargs, layers, vocab)
     core.emb.weight.data.copy_(shared["emb_weight"])
     core.ln.load_state_dict({"weight": shared["ln_weight"], "bias": shared["ln_bias"]})
@@ -249,7 +264,7 @@ def main() -> int:
     tokens = int(ids_batches.numel())
     out = {
         "kind": args.update_kind,
-        "worker_id": pkg.get("worker_id"),
+        "worker_id": args.worker_id or pkg.get("worker_id"),
         "host": platform.node(),
         "block_id": block_id,
         "layers": layers,
