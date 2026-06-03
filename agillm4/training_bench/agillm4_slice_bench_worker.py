@@ -179,6 +179,7 @@ def main() -> int:
     ap.add_argument("--out", required=True)
     ap.add_argument("--device", default="cpu")
     ap.add_argument("--threads", type=int, default=2)
+    ap.add_argument("--update-kind", default="agillm41_dblock_slice_update")
     args = ap.parse_args()
 
     torch.set_num_threads(max(1, int(args.threads)))
@@ -247,7 +248,7 @@ def main() -> int:
     wall = max(1e-9, time.time() - start)
     tokens = int(ids_batches.numel())
     out = {
-        "kind": "agillm4_dblock_bench_update_v1",
+        "kind": args.update_kind,
         "worker_id": pkg.get("worker_id"),
         "host": platform.node(),
         "block_id": block_id,

@@ -7,9 +7,12 @@ write update/state stats, but the active checkpoint is not modified.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
+import os
 from pathlib import Path
 import random
+import sys
 import time
 from typing import Any
 
@@ -52,6 +55,32 @@ def token_batches(vocab: int, steps: int, batch_size: int, block_size: int, seed
     return torch.randint(2, int(vocab), (int(steps), int(batch_size), int(block_size)), generator=gen, dtype=torch.long)
 
 
+def load_runtime(path: str | Path):
+    path = Path(path).resolve()
+    os.environ.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V4-Pro")
+    parent = str(path.parent)
+    if parent not in sys.path:
+        sys.path.insert(0, parent)
+    spec = importlib.util.spec_from_file_location("agillm41_export_runtime", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot import AGILLM4.1 runtime from {path}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["agillm41_export_runtime"] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def real_token_batches(runtime: Any, source: str, steps: int, batch_size: int, block_size: int, seed: int) -> torch.Tensor:
+    if source == "__default__":
+        source = getattr(runtime, "DEFAULT_PRETRAIN_SOURCES")
+    total = int(steps) * int(batch_size) * int(block_size)
+    stream = runtime.token_stream(source, total, seed=int(seed), streaming=True)
+    data = []
+    for _ in range(total):
+        data.append(int(next(stream)))
+    return torch.tensor(data, dtype=torch.long).view(int(steps), int(batch_size), int(block_size))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Export AGILLM4 all-node benchmark packages")
     ap.add_argument("--ckpt", required=True)
@@ -62,6 +91,8 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=1)
     ap.add_argument("--block-size", type=int, default=128)
     ap.add_argument("--seed", type=int, default=20260602)
+    ap.add_argument("--runtime", default="agillm41.py", help="AGILLM4.1 runtime path used when --source is set")
+    ap.add_argument("--source", default="", help="Real token source. Use __default__ for the runtime default pretrain mix; empty keeps synthetic benchmark IDs.")
     ap.add_argument("--attn-backend", choices=["manual", "sdpa", "sublinear"], default="manual")
     ap.add_argument("--sublinear-window", type=int, default=128)
     ap.add_argument("--sublinear-stride", type=int, default=128)
@@ -93,6 +124,7 @@ def main() -> int:
     vocab = int(core["emb.weight"].shape[0])
     assignments = dblock_layers(int(cfg["layers"]), int(args.dblock_blocks))
     tie_weights = bool(ck.get("tie_weights", False))
+    runtime = load_runtime(args.runtime) if args.source else None
 
     shared = {
         "kind": "agillm4_bench_shared_v1",
@@ -141,7 +173,13 @@ def main() -> int:
 
     for idx, (worker_id, block_id) in enumerate(workers):
         layers = assignments[int(block_id)]
-        ids = token_batches(vocab, args.steps, args.batch_size, args.block_size, args.seed + idx * 1009)
+        batch_seed = args.seed + idx * 1009
+        if runtime is not None:
+            ids = real_token_batches(runtime, args.source, args.steps, args.batch_size, args.block_size, batch_seed)
+            data_mode = "real"
+        else:
+            ids = token_batches(vocab, args.steps, args.batch_size, args.block_size, batch_seed)
+            data_mode = "synthetic"
         pkg = {
             "kind": "agillm4_dblock_bench_package_v1",
             "worker_id": worker_id,
@@ -155,6 +193,8 @@ def main() -> int:
             "steps": int(args.steps),
             "batch_size": int(args.batch_size),
             "block_size": int(args.block_size),
+            "data_mode": data_mode,
+            "source": args.source,
             "ids_batches": ids,
             "block_state": local_block_state(core, layers),
             "runtime_args": {
