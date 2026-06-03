@@ -80,6 +80,11 @@ def load_ckpt(runtime: Any, ckpt_path: str | Path) -> dict[str, Any]:
 
 
 def checkpoint_vocab_size(runtime: Any, sd: dict[str, Any]) -> int | None:
+    if sd.get("vocab") is not None:
+        try:
+            return int(sd["vocab"])
+        except Exception:
+            pass
     core = sd.get("core")
     if isinstance(core, dict):
         try:
