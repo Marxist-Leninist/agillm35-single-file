@@ -142,7 +142,7 @@ def run_worker(args: argparse.Namespace, lease: dict[str, Any], package: Path, f
     env["OMP_NUM_THREADS"] = threads
     env["MKL_NUM_THREADS"] = threads
     env["OPENBLAS_NUM_THREADS"] = threads
-    env.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V3.2")
+    env.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V4-Pro")
     if args.worker_cmd:
         template_data = {
             "package": str(package),

@@ -6,9 +6,11 @@ existing AGILLM3.5 worker paths and checkpoint tooling keep working.
 """
 from pathlib import Path
 import importlib.util
+import os
 import sys
 
 
+os.environ.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V3.2")
 _TARGET = Path(__file__).with_name("agillm41.py")
 _SPEC = importlib.util.spec_from_file_location("agillm41_runtime", _TARGET)
 if _SPEC is None or _SPEC.loader is None:

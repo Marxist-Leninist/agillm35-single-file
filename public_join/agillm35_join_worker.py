@@ -7,6 +7,7 @@ import sys
 
 
 _TARGET = Path(__file__).with_name("agillm41_join_worker.py")
+os.environ.setdefault("TOKENIZER_ID", "deepseek-ai/DeepSeek-V3.2")
 
 if __name__ == "__main__":
     os.execv(sys.executable, [sys.executable, str(_TARGET), *sys.argv[1:]])

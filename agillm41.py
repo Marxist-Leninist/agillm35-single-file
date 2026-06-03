@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """AGILLM4.1 mainline single-file trainer/inference runtime.
 
-Historically this was AGILLM3.5. It is now the promoted AGILLM4.1 mainline:
-the AGILLM3 checkpoint/tokenizer contract running on the AGILLM4
-DiffusionBlock/MoE runtime path. This file is mechanically folded from AGILLM4
-plus AGILLM3 compatibility patches:
-- DeepSeek-V3.2 tokenizer/checkpoint contract
-- AGILLM3 large preset (d=1024, layers=24, heads=16, rank=128)
-- AR + SAT checkpoint schema, NAT disabled in --agillm3_compat
-- DiffusionBlock training support
+AGILLM4.1 is the promoted AGILLM4 mainline evolved from the AGILLM3.5
+prototype, and it is larger than AGILLM3/AGILLM3.5. Resumed checkpoints are
+the source of truth for the exact architecture, with AGILLM4 presets available
+for fresh starts. This file is mechanically folded from AGILLM4 plus
+compatibility patches:
+- DeepSeek-V4-Pro tokenizer/checkpoint support by default
+- DeepSeek-V3.2 legacy compatibility support through the agillm35 shim
+- AR + SAT checkpoint schema compatibility; NAT can be disabled with --agillm3_compat
+- DiffusionBlock training support and optional async side-update ingestion
 """
 from __future__ import annotations
 
@@ -1410,7 +1411,7 @@ try:
 except Exception:
     pass
 
-TOKENIZER_ID = os.environ.get("TOKENIZER_ID", "deepseek-ai/DeepSeek-V3.2")
+TOKENIZER_ID = os.environ.get("TOKENIZER_ID", "deepseek-ai/DeepSeek-V4-Pro")
 SYNTHETIC_TOKENIZER = os.environ.get("AGILLM_SYNTHETIC_TOKENIZER", "").lower() in {"1", "true", "yes"}
 
 class _SyntheticTokenizer:
@@ -3071,6 +3072,112 @@ def _phase_freeze(core: nn.Module, *, freeze_core: bool, unfreeze_ln: bool, trai
         if train_emb:
             for p in core.emb.parameters(): p.requires_grad = True
 
+def _side_update_unique_path(directory: pathlib.Path, name: str) -> pathlib.Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    dest = directory / name
+    if not dest.exists():
+        return dest
+    stem, suffix = dest.stem, dest.suffix
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    for idx in range(1000):
+        candidate = directory / f"{stem}.{stamp}.{idx}{suffix}"
+        if not candidate.exists():
+            return candidate
+    return directory / f"{stem}.{stamp}.{os.getpid()}{suffix}"
+
+def _side_update_move(path: pathlib.Path, directory: pathlib.Path) -> pathlib.Path:
+    dest = _side_update_unique_path(directory, path.name)
+    try:
+        path.replace(dest)
+    except OSError:
+        import shutil
+
+        shutil.move(str(path), str(dest))
+    return dest
+
+def _apply_async_side_updates(core: nn.Module, cfg: dict, args, step: int) -> list[dict]:
+    update_dir_s = str(getattr(args, "async_update_dir", "") or "").strip()
+    alpha = float(getattr(args, "async_update_alpha", 1.0) or 0.0)
+    if not update_dir_s or alpha <= 0.0:
+        return []
+    update_dir = pathlib.Path(update_dir_s)
+    if not update_dir.exists():
+        return []
+    max_updates = max(1, int(getattr(args, "async_update_max_per_check", 1) or 1))
+    max_age = float(getattr(args, "async_update_max_age_sec", 0.0) or 0.0)
+    accepted_dir = pathlib.Path(getattr(args, "async_update_accepted_dir", "") or (update_dir.parent / "accepted"))
+    rejected_dir = pathlib.Path(getattr(args, "async_update_rejected_dir", "") or (update_dir.parent / "rejected"))
+    param_map = dict(core.named_parameters())
+    buffer_map = dict(core.named_buffers())
+    now = time.time()
+    applied: list[dict] = []
+    candidates = sorted(
+        [p for p in update_dir.glob("*.pt") if p.is_file() and not p.name.endswith(".tmp")],
+        key=lambda p: p.stat().st_mtime,
+    )
+    for path in candidates[:max_updates]:
+        reject_reason = ""
+        try:
+            if max_age > 0 and now - path.stat().st_mtime > max_age:
+                reject_reason = f"stale update older than {max_age:g}s"
+                raise ValueError(reject_reason)
+            upd = torch.load(path, map_location="cpu", weights_only=False)
+            kind = upd.get("kind")
+            if kind not in {"agillm35_dblock_slice_update", "agillm4_dblock_slice_update", "agillm41_dblock_slice_update"}:
+                raise ValueError(f"bad update kind {kind!r}")
+            if dict(upd.get("cfg", {})) != dict(cfg):
+                raise ValueError("cfg mismatch")
+            block_state = upd.get("block_state")
+            if not isinstance(block_state, dict) or not block_state:
+                raise ValueError("missing block_state")
+            changed = 0
+            with torch.no_grad():
+                for key, value in block_state.items():
+                    target = param_map.get(key)
+                    if target is None:
+                        target = buffer_map.get(key)
+                    if target is None:
+                        raise KeyError(f"unknown core key {key}")
+                    if tuple(value.shape) != tuple(target.shape):
+                        raise ValueError(f"{key} shape mismatch update={tuple(value.shape)} target={tuple(target.shape)}")
+                    src = value.to(device=target.device, dtype=target.dtype, non_blocking=True)
+                    if alpha >= 1.0:
+                        target.copy_(src)
+                    else:
+                        target.lerp_(src, alpha)
+                    changed += 1
+                    del src
+            dest = _side_update_move(path, accepted_dir)
+            rec = {
+                "path": str(dest),
+                "worker_id": upd.get("worker_id"),
+                "block_id": upd.get("block_id"),
+                "layers": upd.get("layers"),
+                "tokens": int(upd.get("tokens") or 0),
+                "tok_per_sec": float(upd.get("tok_per_sec") or 0.0),
+                "alpha": alpha,
+                "keys": changed,
+            }
+            applied.append(rec)
+            print(json.dumps({"event": "async_side_update_applied", "step": step, **rec}), flush=True)
+        except Exception as exc:
+            try:
+                dest = _side_update_move(path, rejected_dir)
+            except Exception:
+                dest = path
+            print(
+                json.dumps(
+                    {
+                        "event": "async_side_update_rejected",
+                        "step": step,
+                        "path": str(dest),
+                        "error": reject_reason or str(exc),
+                    }
+                ),
+                flush=True,
+            )
+    return applied
+
 def _optimizer_param_groups(core, ar_h, sat_h, lr_core: float, lr_head: float, nat_h=None):
     # Shared/tied vocab projections must appear in only one optimizer group.
     # VRAM-first AGILLM-4 uses one embedding/projection tensor for AR/SAT/NAT.
@@ -3333,6 +3440,9 @@ def _train_phase(
         seen_tok += toks_processed
         pbar.set_postfix(loss=f"{loss_value:.3f}", B=BATCH, L=BLOCK)
         pbar.update(toks_processed)
+        async_every = int(getattr(args, "async_update_every_steps", 0) or 0)
+        if async_every > 0 and (step % async_every) == 0:
+            _apply_async_side_updates(core, cfg, args, step)
         empty_cache_every = int(getattr(args, "empty_cache_every_steps", 0) or 0)
         if DEV.type == "cuda" and empty_cache_every > 0 and (step % empty_cache_every) == 0:
             try:
@@ -3428,12 +3538,17 @@ def train(args):
         args.dblock_nat_prob = 0.0
         args.reinit_nat = False
         args.seed_nat_from_ar = False
-        print("[agillm4.1] compatibility mode: DeepSeek-V3.2 tokenizer, AR+SAT checkpoint schema, NAT disabled")
+        print(f"[agillm4.1] legacy compatibility mode: tokenizer={TOKENIZER_ID}, AR+SAT checkpoint schema, NAT disabled")
     cfg = PRESETS[args.preset].copy()
     tie_weights = args.tie_weights
     print_expansion_info(cfg, tie_weights)
     if not args.fresh:
-        src_probe = pathlib.Path(args.warmstart_from) if args.warmstart_from else pathlib.Path(args.save_dir) / "final.pt"
+        if args.warmstart_from:
+            src_probe = pathlib.Path(args.warmstart_from)
+        elif args.resume:
+            src_probe = pathlib.Path(args.resume)
+        else:
+            src_probe = pathlib.Path(args.save_dir) / "final.pt"
         prev_cfg = infer_cfg_from_ckpt(src_probe)
     else: prev_cfg = None
     if prev_cfg:
@@ -3458,7 +3573,7 @@ def train(args):
         args.dblock_nat_prob = 0.0
     print(f"Config: {cfg}")
     print(
-        "AGILLM-3.5 single-file runtime: "
+        "AGILLM4.1 single-file runtime: "
         f"attn_backend={args.attn_backend} grad_checkpoint={args.grad_checkpoint} "
         f"sublinear_window={args.sublinear_window} sublinear_stride={args.sublinear_stride} "
         f"sublinear_max_anchors={args.sublinear_max_anchors} sublinear_chunk={args.sublinear_chunk} "
