@@ -1448,7 +1448,7 @@ else:
         tok.add_special_tokens({"pad_token": "<|pad|>"})
 
 # ─── Fix tokenizer Ġ/▁ mismatch ───
-# The DeepSeek-V3.2 vocab uses Ġ (U+0120) for space-prefixed tokens,
+# Some DeepSeek tokenizer releases use Ġ (U+0120) for space-prefixed tokens,
 # but some transformers versions set the Metaspace pre-tokenizer to use
 # ▁ (U+2581) instead, causing encode/decode to lose all spaces.
 def _fix_tokenizer_space_mismatch(tokenizer):
@@ -4055,6 +4055,20 @@ def main():
     tr.add_argument("--delta_every_steps", type=int, default=DEFAULT_DELTA_STEPS, help="Weight-only delta save every N steps (0=off)")
     tr.add_argument("--delta_max_keep", type=int, default=DEFAULT_MAX_DELTAS, help="Max delta checkpoints to keep")
     tr.add_argument("--resume_delta", type=str, help="Resume from a delta (weight-only, no optimizer state)")
+    tr.add_argument("--async_update_dir", default="",
+                    help="Optional incoming directory for verified DBlock side updates. Empty disables async side updates.")
+    tr.add_argument("--async_update_every_steps", type=int, default=0,
+                    help="Poll --async_update_dir every N master steps. Side workers never block master progress.")
+    tr.add_argument("--async_update_alpha", type=float, default=1.0,
+                    help="Blend factor for accepted side updates: 1.0 copies side block weights; lower values lerp into live weights.")
+    tr.add_argument("--async_update_max_per_check", type=int, default=1,
+                    help="Maximum side-update files to apply per poll.")
+    tr.add_argument("--async_update_max_age_sec", type=float, default=0.0,
+                    help="Reject incoming side updates older than this many seconds. 0 disables age rejection.")
+    tr.add_argument("--async_update_accepted_dir", default="",
+                    help="Directory for applied side-update files. Defaults to a sibling accepted/ directory.")
+    tr.add_argument("--async_update_rejected_dir", default="",
+                    help="Directory for rejected side-update files. Defaults to a sibling rejected/ directory.")
     tr.add_argument("--save_dir", default=str(CKDIR))
     tr.add_argument("--resume", type=str)
     tr.add_argument("--x2", action="store_true")
@@ -4065,7 +4079,7 @@ def main():
     tr.add_argument("--tie_weights", action="store_true")
     tr.add_argument("--ar_only", action="store_true")
     tr.add_argument("--agillm3_compat", action="store_true",
-                    help="AGILLM4.1 compatibility mode: preserve AGILLM3 tokenizer/checkpoint contract while using AGILLM4 runtime/dblock features.")
+                    help="Legacy AGILLM3/3.5 checkpoint mode. Use TOKENIZER_ID=deepseek-ai/DeepSeek-V3.2 or the agillm35.py shim for the old tokenizer contract.")
     tr.add_argument("--no_nat_head", action="store_true",
                     help="Do not instantiate/save a NAT head. Keeps AGILLM3 AR+SAT checkpoint schema and reduces params/RAM.")
     tr.add_argument("--sat_every", type=int, default=1,
